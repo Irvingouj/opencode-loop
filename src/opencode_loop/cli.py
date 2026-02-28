@@ -12,6 +12,7 @@ from opencode_loop.config import (
     resolve_done_criteria,
     resolve_goal,
 )
+from opencode_loop.help_text import build_supervisor_help_text
 from opencode_loop.loop_state import LoopConfig, LoopRuntimeState
 from opencode_loop.orchestrator import run_loop
 from opencode_loop.prompts import DEFAULT_EVALUATOR_PROMPT, DEFAULT_IMPLEMENTER_PROMPT
@@ -21,8 +22,21 @@ from opencode_loop.state import default_state_path
 from opencode_loop.tui import console, print_startup_panel
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run OpenCode eval/execute loop")
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run OpenCode eval/execute loop", add_help=False
+    )
+    parser.add_argument(
+        "--help",
+        action="store_true",
+        help="Show the detailed supervisor/LLM operating manual",
+    )
+    parser.add_argument(
+        "-h",
+        "--help-human",
+        action="help",
+        help="Show the concise human-oriented CLI option list and exit",
+    )
     parser.add_argument(
         "-c",
         "--continue",
@@ -99,7 +113,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not pass full evaluator JSON to implementer prompt",
     )
-    return parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.help:
+        print(build_supervisor_help_text())
+        raise SystemExit(0)
+    return args
 
 
 def load_fresh_context(args: argparse.Namespace) -> tuple[LoopConfig, LoopRuntimeState]:
