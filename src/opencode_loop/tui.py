@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Any
 
@@ -15,7 +16,99 @@ from rich.text import Text
 
 from opencode_loop.templates import _compact_json, _pick_first_str
 
-console = Console(highlight=False)
+console = Console(highlight=False, log_path=False)
+
+
+def _emit(message: str = "") -> None:
+    console.print(message)
+
+
+def _truncate(value: str, limit: int = 160) -> str:
+    text = value.strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: limit - 1]}…"
+
+
+def _shorten_path_text(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return text
+
+    cwd = os.getcwd()
+    if text.startswith(cwd + os.sep):
+        return os.path.relpath(text, cwd)
+    return text
+
+
+def _summarize_mapping(value: dict[str, Any]) -> str:
+    preferred_keys = [
+        "filePath",
+        "path",
+        "pattern",
+        "command",
+        "tool",
+        "name",
+        "status",
+    ]
+    bits: list[str] = []
+    seen: set[str] = set()
+
+    for key in preferred_keys:
+        if key not in value:
+            continue
+        seen.add(key)
+        rendered = _compact_value(value[key], 80)
+        bits.append(f"{key}={rendered}")
+
+    for key, item in value.items():
+        if key in seen:
+            continue
+        bits.append(f"{key}={_compact_value(item, 80)}")
+        if len(bits) >= 4:
+            break
+
+    return ", ".join(bits) if bits else _compact_json(value)
+
+
+def _compact_value(value: Any, limit: int = 160) -> str:
+    if isinstance(value, str):
+        return _truncate(_shorten_path_text(value), limit)
+    if isinstance(value, dict):
+        return _truncate(_summarize_mapping(value), limit)
+    if isinstance(value, list):
+        rendered_items = [_compact_value(item, 48) for item in value[:4]]
+        if len(value) > 4:
+            rendered_items.append("…")
+        return _truncate(", ".join(rendered_items), limit)
+    return _truncate(_compact_json(value), limit)
+
+
+def _tool_input_summary(state: dict[str, Any]) -> str:
+    input_value = state.get("input")
+    if input_value is None:
+        return ""
+    return _compact_value(input_value)
+
+
+def _tool_output_lines(state: dict[str, Any], max_lines: int = 4) -> list[str]:
+    metadata = state.get("metadata")
+    if isinstance(metadata, dict):
+        preview = metadata.get("preview")
+        if isinstance(preview, str) and preview.strip():
+            return [
+                _compact_value(line, 180) for line in preview.strip().splitlines()[:max_lines]
+            ]
+
+    output = state.get("output")
+    if isinstance(output, str) and output.strip():
+        lines = [_compact_value(line, 180) for line in output.strip().splitlines()[:max_lines]]
+        if all("/" in line for line in lines):
+            return [", ".join(line.rsplit("/", 1)[-1] for line in lines)]
+        return lines
+    if output is None:
+        return []
+    return [_compact_value(output, 180)]
 
 
 def _human_event_summary(obj: dict[str, Any]) -> str:
@@ -42,44 +135,64 @@ def _human_event_summary(obj: dict[str, Any]) -> str:
     return " ".join(bits)
 
 
-def _stream_event_line(
-    label: str, obj: dict[str, Any], state: dict[str, Any], verbose: bool
-) -> None:
+def _stream_event_line(label: str, obj: dict[str, Any], state: dict[str, Any]) -> None:
     typ = str(obj.get("type", ""))
     part = obj.get("part", {}) if isinstance(obj.get("part"), dict) else {}
     step_no = int(state.get("step_no", 0))
+    phase = label.split(":", 1)[-1] if ":" in label else label
+    phase_title = phase.upper()
 
     if typ == "step_start":
-        state["step_no"] = step_no + 1
+        next_step = step_no + 1
+        state["step_no"] = next_step
         state["in_step"] = True
         state["step_tool"] = None
+        _emit(f"[bold cyan]{phase_title}[/bold cyan] step {next_step}")
         return
 
     if typ == "tool_use":
-        name = _pick_first_str(part, ["name", "toolName", "tool"])
+        name = _pick_first_str(part, ["name", "toolName", "tool"]) or "unknown-tool"
+        tool_state = part.get("state", {}) if isinstance(part.get("state"), dict) else {}
+        status = _pick_first_str(tool_state, ["status"]) or "unknown"
         state["step_tool"] = name
-        n = state.get("step_no", "?")
-        console.log(f"  [dim]{label}[/dim]  step {n} · [cyan]{name}[/cyan]")
+        _emit(f"  tool [cyan]{name}[/cyan]  [bold]{status}[/bold]")
+        input_summary = _tool_input_summary(tool_state)
+        if input_summary:
+            _emit(f"    in : [dim]{input_summary}[/dim]")
+        for line in _tool_output_lines(tool_state):
+            _emit(f"    out: [dim]{line}[/dim]")
         return
 
     if typ == "step_finish":
         reason = part.get("reason", "")
-        if reason == "stop":
-            n = state.get("step_no", "?")
-            console.log(f"  [dim]{label}[/dim]  step {n} · [dim]↩ stop[/dim]")
+        tokens = part.get("tokens", {}) if isinstance(part.get("tokens"), dict) else {}
+        token_bits: list[str] = []
+        for key in ["input", "output", "reasoning", "total"]:
+            value = tokens.get(key)
+            if isinstance(value, int):
+                token_bits.append(f"{key}={value}")
+        token_suffix = f"  [dim]{' '.join(token_bits)}[/dim]" if token_bits else ""
+        reason_text = reason or "unknown"
+        _emit(f"  done: {reason_text}{token_suffix}")
         state["in_step"] = False
         return
 
-    if typ == "text":
-        if verbose:
-            txt = part.get("text", "")
-            if txt.strip():
-                for ln in txt.strip().splitlines():
-                    console.log(f"  [dim]{label} {ln}[/dim]")
+    if typ == "reasoning":
+        txt = part.get("text", "")
+        if isinstance(txt, str) and txt.strip():
+            _emit(f"  think: [dim]{_truncate(txt, 180)}[/dim]")
         return
 
-    if verbose:
-        console.log(f"[dim]{label} {_human_event_summary(obj)}[/dim]")
+    if typ == "text":
+        txt = part.get("text", "")
+        if isinstance(txt, str) and txt:
+            lines = txt.splitlines() or [txt]
+            for ln in lines:
+                rendered = ln if ln.strip() else " "
+                _emit(f"  text: {rendered}")
+        return
+
+    _emit(f"  [dim]{_human_event_summary(obj)}[/dim]")
 
 
 def print_startup_panel(args, goal: str, checks: list[str]) -> None:
@@ -127,26 +240,26 @@ def print_eval_result(
         if is_done
         else "[bold yellow]→ CONTINUE[/bold yellow]"
     )
-    console.log(f"Evaluator result  {status_icon}  ({elapsed:.1f}s)")
-    console.log(f"  [italic]{reason}[/italic]")
+    _emit(f"Evaluator result  {status_icon}  ({elapsed:.1f}s)")
+    _emit(f"  [italic]{reason}[/italic]")
     if not is_done and next_task:
         first_line = next_task.split("\n")[0].strip()
-        console.log(
+        _emit(
             f"  [bold]Next task:[/bold] {first_line[:140]}{'…' if len(first_line) > 140 or chr(10) in next_task else ''}"
         )
     if checks_count:
-        console.log(f"  [dim]Effective checks: {checks_count}[/dim]")
+        _emit(f"  [dim]Effective checks: {checks_count}[/dim]")
 
 
 def print_exec_result(
     i: int, summary: str, files_touched: list[str], elapsed: float
 ) -> None:
-    console.log(f"Implementer result  [bold green]✔[/bold green]  ({elapsed:.1f}s)")
+    _emit(f"Implementer result  [bold green]✔[/bold green]  ({elapsed:.1f}s)")
     if summary:
-        console.log(f"  [italic]{summary[:200]}[/italic]")
+        _emit(f"  [italic]{summary[:200]}[/italic]")
     if files_touched:
         for f in files_touched:
-            console.log(f"  [dim cyan]  touched:[/dim cyan] {f}")
+            _emit(f"  [dim cyan]touched:[/dim cyan] {_shorten_path_text(f)}")
 
 
 def print_run_summary(history: list[dict[str, Any]]) -> None:

@@ -8,15 +8,13 @@ from opencode_loop.tui import _stream_event_line, console
 from opencode_loop.templates import schema_text
 
 
-def run_opencode(
+def build_opencode_cmd(
     message: str,
     args,
     session_id: str | None,
     use_continue: bool = False,
-    stream_label: str = "opencode",
-    verbose: bool = False,
-) -> tuple[str, str]:
-    cmd = ["opencode", "run", "--format", "json"]
+) -> list[str]:
+    cmd = ["opencode", "run", "--format", "json", "--thinking"]
     if args.model:
         cmd += ["--model", args.model]
     if args.agent:
@@ -26,6 +24,17 @@ def run_opencode(
     elif session_id:
         cmd += ["--session", session_id]
     cmd.append(message)
+    return cmd
+
+
+def run_opencode(
+    message: str,
+    args,
+    session_id: str | None,
+    use_continue: bool = False,
+    stream_label: str = "opencode",
+) -> tuple[str, str]:
+    cmd = build_opencode_cmd(message, args, session_id, use_continue)
 
     proc = subprocess.Popen(
         cmd,
@@ -55,7 +64,7 @@ def run_opencode(
         if isinstance(sid_line, str) and sid_line:
             sid = sid_line
 
-        _stream_event_line(stream_label, obj, stream_state, verbose)
+        _stream_event_line(stream_label, obj, stream_state)
 
         if obj.get("type") == "text":
             part = obj.get("part", {}) if isinstance(obj.get("part"), dict) else {}
@@ -78,7 +87,6 @@ def recover_empty_text_output(
     phase: str,
     schema: dict[str, Any],
     attempts: int,
-    verbose: bool = False,
 ) -> tuple[str, str]:
     current_session = session_id
     for n in range(1, attempts + 1):
@@ -100,7 +108,6 @@ def recover_empty_text_output(
             current_session,
             use_continue=True,
             stream_label=f"{phase}:continue#{n}",
-            verbose=verbose,
         )
         if text.strip():
             return text, current_session

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Callable
 
 from opencode_loop.templates import schema_text
 
@@ -129,6 +129,12 @@ def normalize_wrapped_schema_output(
     return merged
 
 
+def _format_repair_issues(issues: list[str]) -> str:
+    if not issues:
+        return "machine parsing/validation failed"
+    return "; ".join(issues)
+
+
 def parse_json_with_repair(
     text: str,
     args,
@@ -137,15 +143,21 @@ def parse_json_with_repair(
     schema: dict[str, Any],
     attempts: int,
     use_continue_on_repair: bool,
-    verbose: bool = False,
-) -> tuple[dict[str, Any], str]:
+    semantic_validator: Callable[[dict[str, Any]], list[str]] | None = None,
+) -> tuple[dict[str, Any], str, bool]:
     from opencode_loop.runner import run_opencode
 
+    last_issues: list[str] = []
     try:
         data = parse_json_payload(text)
         data = normalize_wrapped_schema_output(data, schema)
         validate_against_schema(data, schema, phase)
-        return data, session_id
+        if semantic_validator is not None:
+            issues = semantic_validator(data)
+            if issues:
+                last_issues = issues
+                raise ValueError(f"{phase} JSON semantic validation failed: {issues}")
+        return data, session_id, False
     except Exception as exc:
         last_exc: Exception = exc
 
@@ -158,8 +170,9 @@ def parse_json_with_repair(
         console.log(
             f"[yellow]⚠ {phase} output invalid — attempting repair (attempt {n + 1}/{attempts})[/yellow]"
         )
+        issues_text = _format_repair_issues(last_issues)
         repair_prompt = (
-            f"Your previous {phase} response was invalid for machine parsing/validation.\n"
+            f"Hi, you returned a {phase} response that was invalid because {issues_text}.\n"
             "Return ONE valid JSON object only, no markdown, no code fences, no commentary.\n"
             "Keep same semantics as your previous answer.\n"
             "IMPORTANT: Do NOT wrap fields under keys like 'required' or 'optional'.\n"
@@ -174,15 +187,25 @@ def parse_json_with_repair(
             current_session,
             use_continue=use_continue_on_repair,
             stream_label=f"{phase}:repair",
-            verbose=verbose,
         )
         current_text = repaired_text
         try:
             data = parse_json_payload(repaired_text)
             data = normalize_wrapped_schema_output(data, schema)
             validate_against_schema(data, schema, phase)
-            return data, current_session
+            if semantic_validator is not None:
+                issues = semantic_validator(data)
+                if issues:
+                    last_issues = issues
+                    raise ValueError(
+                        f"{phase} JSON semantic validation failed after repair: {issues}"
+                    )
+            return data, current_session, True
         except Exception as exc:
             last_exc = exc
+            if semantic_validator is not None and "data" in locals() and isinstance(data, dict):
+                last_issues = semantic_validator(data)
+            else:
+                last_issues = []
 
     raise ValueError(f"Unable to parse valid {phase} JSON after retries: {last_exc}")
